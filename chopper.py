@@ -108,14 +108,29 @@ class ChopperApp:
         
     def chop_excel(self, input_file, output_dir, filename_no_ext, num_rows):
         try:
-            df = pd.read_excel(input_file)
+            # Read all columns as text (str) by using the dtype parameter
+            df = pd.read_excel(input_file, dtype=str)
             total_rows = df.shape[0]
+            
             for i in range(0, total_rows, num_rows):
                 chunk = df.iloc[i:i+num_rows]
                 output_file = os.path.join(output_dir, f"{filename_no_ext}_{(i // num_rows)+1}.xlsx")
-                chunk.to_excel(output_file, index=False)
+                
+                with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                    # Writing the chunk to Excel
+                    chunk.to_excel(writer, index=False)
+                    # Get the workbook and worksheet objects
+                    workbook = writer.book
+                    worksheet = writer.sheets['Sheet1']
+                    
+                    # Set the format for each column as 'Text'
+                    for col_num, column in enumerate(chunk.columns, 1):
+                        col_letter = chr(64 + col_num)
+                        worksheet.column_dimensions[col_letter].number_format = '@'  # '@' is the text format in Excel
+                    
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred while processing Excel file: {e}")
+
         
 if __name__ == '__main__':
     root = tk.Tk()
