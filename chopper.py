@@ -1,5 +1,7 @@
 import os
 import sys
+import io
+import csv
 import tempfile
 import threading
 import tkinter as tk
@@ -13,7 +15,7 @@ DEFAULT_ROWS = EXCEL_MAX_ROWS - 10  # 1,048,566
 # --- Optional drag & drop ---
 DND_AVAILABLE = False
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # pip install tkinterdnd2
     DND_AVAILABLE = True
 except Exception:
     DND_AVAILABLE = False
@@ -27,12 +29,20 @@ if sys.platform.startswith("win"):
     except Exception:
         WIN32_AVAILABLE = False
 
+# --- Optional charset detection ---
+CHARDET_AVAILABLE = False
+try:
+    from charset_normalizer import from_bytes  # pip install charset-normalizer
+    CHARDET_AVAILABLE = True
+except Exception:
+    CHARDET_AVAILABLE = False
+
 
 class ChopperApp:
     def __init__(self, master):
         self.master = master
         self.master.title("File Chopper")
-        self.master.minsize(720, 330)
+        self.master.minsize(820, 360)
 
         # State
         self.input_file = tk.StringVar()
@@ -41,10 +51,12 @@ class ChopperApp:
         self.status_text = tk.StringVar(value="Ready.")
         self.last_dir = os.path.expanduser("~")
         self.output_format = tk.StringVar(value="xlsx")  # csv | xlsx | xlsb
+        self.temp_paths = []  # cleaned temp files to delete on exit
 
         # UI
         self._init_dark_theme()
         self._build_ui()
+        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- UI ----------------
     def _init_dark_theme(self):
@@ -65,13 +77,9 @@ class ChopperApp:
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
+        frm = ttk.Frame(self.master, padding=10); frm.grid(sticky="nsew")
+        self.master.grid_columnconfigure(0, weight=1); frm.grid_columnconfigure(1, weight=1)
 
-        frm = ttk.Frame(self.master, padding=10)
-        frm.grid(sticky="nsew")
-        self.master.grid_columnconfigure(0, weight=1)
-        frm.grid_columnconfigure(1, weight=1)
-
-        # Input
         ttk.Label(frm, text="Input file (.csv/.xlsx):").grid(row=0, column=0, sticky="e", **pad)
         self.ent_input = ttk.Entry(frm, textvariable=self.input_file)
         self.ent_input.grid(row=0, column=1, sticky="ew", **pad)
@@ -83,62 +91,53 @@ class ChopperApp:
             self.ent_input.drop_target_register(DND_FILES)
             self.ent_input.dnd_bind("<<Drop>>", self._on_drop_file)
 
-        # Rows per file
         ttk.Label(frm, text="Rows per chunk:").grid(row=2, column=0, sticky="e", **pad)
         self.ent_rows = ttk.Entry(frm, textvariable=self.num_rows, width=16)
         self.ent_rows.grid(row=2, column=1, sticky="w", **pad)
         ttk.Label(frm, text="(default: 1,048,566)").grid(row=2, column=2, sticky="w", **pad)
 
-        # Output dir
         ttk.Label(frm, text="Output folder:").grid(row=3, column=0, sticky="e", **pad)
         self.ent_out = ttk.Entry(frm, textvariable=self.output_dir)
         self.ent_out.grid(row=3, column=1, sticky="ew", **pad)
         ttk.Button(frm, text="Select…", command=self.browse_output_dir).grid(row=3, column=2, **pad)
 
-        # Output format
-        fmt_frame = ttk.Frame(frm)
-        fmt_frame.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+        fmt_frame = ttk.Frame(frm); fmt_frame.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(2,2))
         ttk.Label(fmt_frame, text="Output format:").grid(row=0, column=0, sticky="w")
         for i, (text, val) in enumerate([("CSV", "csv"), ("XLSX", "xlsx"), ("XLSB", "xlsb")], start=1):
             ttk.Radiobutton(fmt_frame, text=text, value=val, variable=self.output_format).grid(row=0, column=i, padx=(12,0))
 
-        # Progress + actions
         self.progress = ttk.Progressbar(frm, mode="determinate")
-        self.progress.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=(8, 2))
-
+        self.progress.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=(8,2))
         self.lbl_status = ttk.Label(frm, textvariable=self.status_text)
-        self.lbl_status.grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.lbl_status.grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(0,6))
 
         self.btn_start = ttk.Button(frm, text="Start", command=self.start_chopping)
         self.btn_start.grid(row=7, column=1, sticky="e", padx=10, pady=10)
-        ttk.Button(frm, text="Quit", command=self.master.destroy).grid(row=7, column=2, sticky="w", padx=10, pady=10)
+        ttk.Button(frm, text="Quit", command=self._on_close).grid(row=7, column=2, sticky="w", padx=10, pady=10)
 
     # ------------- Events -------------
     def _on_drop_file(self, event):
         raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            raw = raw[1:-1]
+        if raw.startswith("{") and raw.endswith("}"): raw = raw[1:-1]
         path = raw.split("} {")[0] if "} {" in raw else raw
-        path = path.strip()
         if os.path.isfile(path):
             self.input_file.set(path)
             self.last_dir = os.path.dirname(path)
 
     def browse_input_file(self):
-        filename = filedialog.askopenfilename(
+        fn = filedialog.askopenfilename(
             title="Select input file",
             initialdir=self.last_dir,
             filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx"), ("All files", "*.*")]
         )
-        if filename:
-            self.input_file.set(filename)
-            self.last_dir = os.path.dirname(filename)
+        if fn:
+            self.input_file.set(fn)
+            self.last_dir = os.path.dirname(fn)
 
     def browse_output_dir(self):
-        directory = filedialog.askdirectory(title="Select output folder", initialdir=self.last_dir)
-        if directory:
-            self.output_dir.set(directory)
-            self.last_dir = directory
+        d = filedialog.askdirectory(title="Select output folder", initialdir=self.last_dir)
+        if d:
+            self.output_dir.set(d); self.last_dir = d
 
     # ------------- Core -------------
     def start_chopping(self):
@@ -146,31 +145,21 @@ class ChopperApp:
         out_dir = self.output_dir.get().strip()
         out_fmt = self.output_format.get()
 
-        if not in_path:
-            messagebox.showerror("Error", "Please select an input file.")
-            return
-        if not out_dir:
-            messagebox.showerror("Error", "Please select an output folder.")
-            return
+        if not in_path: return messagebox.showerror("Error", "Please select an input file.")
+        if not out_dir: return messagebox.showerror("Error", "Please select an output folder.")
 
         try:
             rows = int(self.num_rows.get())
-            if rows <= 0:
-                raise ValueError
+            if rows <= 0: raise ValueError
         except Exception:
-            messagebox.showerror("Error", "Rows per chunk must be a positive integer.")
-            return
+            return messagebox.showerror("Error", "Rows per chunk must be a positive integer.")
 
         ext = os.path.splitext(in_path)[1].lower()
         if ext not in (".csv", ".xlsx"):
-            messagebox.showerror("Error", "Unsupported input type. Use .csv or .xlsx.")
-            return
+            return messagebox.showerror("Error", "Unsupported input type. Use .csv or .xlsx.")
 
         if out_fmt == "xlsb" and not (sys.platform.startswith("win") and WIN32_AVAILABLE):
-            messagebox.showwarning(
-                "XLSB not available",
-                "XLSB export needs Excel + pywin32 on Windows. Falling back to XLSX."
-            )
+            messagebox.showwarning("XLSB not available", "XLSB export needs Excel + pywin32 on Windows. Falling back to XLSX.")
             self.output_format.set("xlsx")
             out_fmt = "xlsx"
 
@@ -187,7 +176,22 @@ class ChopperApp:
         try:
             stem = os.path.splitext(os.path.basename(in_path))[0]
             if in_ext == ".csv":
-                self._chop_csv_resilient(in_path, out_dir, stem, rows, out_fmt)
+                total_rows_bin = self._count_lines_binary(in_path)
+                if total_rows_bin is None:
+                    self._progress_indeterminate_start()
+                else:
+                    approx = max(0, total_rows_bin - 1)
+                    est_chunks = max(1, (approx + rows - 1) // rows)
+                    self._set_progress_total(est_chunks)
+
+                clean_path, enc_used = self._transcode_csv_to_utf8_temp(in_path)
+                delim = self._sniff_delimiter(clean_path) or ","
+                self._set_status(f"Cleaned CSV → UTF-8 ({enc_used}), delimiter='{delim}'.")
+                self._chop_clean_csv(clean_path, out_dir, stem, rows, out_fmt, delimiter=delim)
+
+                if total_rows_bin is None:
+                    self._progress_indeterminate_stop()
+
             else:
                 self._chop_xlsx(in_path, out_dir, stem, rows, out_fmt)
 
@@ -200,66 +204,69 @@ class ChopperApp:
             self._set_busy(False)
             self._progress_reset()
 
-    # ------------- Encoding-robust CSV -------------
-    def _csv_chunk_iter(self, path, rows):
-        """
-        Yield pandas chunks with progressively more lenient decoding.
-        """
-        encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
-        last_err = None
-        for enc in encodings:
+    # ------------- Cleaning / detection -------------
+    def _detect_encoding(self, sample_bytes: bytes) -> str:
+        if CHARDET_AVAILABLE:
+            res = from_bytes(sample_bytes).best()
+            if res and res.encoding:
+                return res.encoding
+        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1"):
             try:
-                # Fast engine first; low_memory=False for stable dtypes
-                return pd.read_csv(path, chunksize=rows, encoding=enc, low_memory=False)
-            except Exception as e:
-                last_err = e
+                sample_bytes.decode(enc)
+                return enc
+            except Exception:
+                continue
+        return "latin1"
 
-        # Final fallback: python engine + skip bad lines
+    def _transcode_csv_to_utf8_temp(self, path: str):
+        with open(path, "rb") as f:
+            sample = f.read(128 * 1024)
+        enc = self._detect_encoding(sample)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="chopper_clean_", suffix=".csv")
+        os.close(tmp_fd)
+        self.temp_paths.append(tmp_path)
+
+        self._set_status(f"Cleaning input (encoding≈{enc})…")
+        with open(path, "rb") as fin, io.open(tmp_path, "w", encoding="utf-8", newline="\n") as fout:
+            decoder = io.TextIOWrapper(fin, encoding=enc, errors="replace", newline=None)
+            while True:
+                chunk = decoder.read(1_000_000)
+                if not chunk:
+                    break
+                chunk = chunk.replace("\ufeff", "").replace("\xa0", " ").replace("\x00", "")
+                fout.write(chunk)
+
+        return tmp_path, enc
+
+    def _sniff_delimiter(self, utf8_path: str):
         try:
-            return pd.read_csv(
-                path, chunksize=rows, encoding="latin1",
-                engine="python", on_bad_lines="skip", low_memory=False
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Unable to decode CSV with common encodings. Last error: {last_err or e}"
-            )
+            with open(utf8_path, "r", encoding="utf-8", newline="") as f:
+                sample = f.read(64 * 1024)
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
+            return dialect.delimiter
+        except Exception:
+            return None
 
-    def _chop_csv_resilient(self, in_path, out_dir, stem, rows, out_fmt):
-        # Try to count rows in a binary-safe way; if it fails, go indeterminate
-        total_rows = self._try_count_rows_binary(in_path)
-        if total_rows is None:
-            self._progress_indeterminate_start()
-            self._set_status("Reading CSV (unknown encoding)…")
-        else:
-            chunks_est = max(1, (total_rows + rows - 1) // rows)
-            self._set_status(f"CSV rows (approx): {total_rows:,}. Creating up to {chunks_est} chunk(s)…")
-            self._set_progress_total(chunks_est)
-
-        chunk_iter = self._csv_chunk_iter(in_path, rows)
-        written = 0
-        for idx, chunk in enumerate(chunk_iter, start=1):
-            out_path = self._safe_out_path(out_dir, stem, idx, out_fmt)
+    # ------------- CSV chopping (using cleaned UTF-8) -------------
+    def _chop_clean_csv(self, clean_path, out_dir, stem, rows, out_fmt, delimiter=","):
+        i = 0
+        for i, chunk in enumerate(
+            pd.read_csv(clean_path, chunksize=rows, encoding="utf-8", low_memory=False, sep=delimiter),
+            start=1
+        ):
+            out_path = self._safe_out_path(out_dir, stem, i, out_fmt)
             self._write_out(chunk, out_path, out_fmt)
-            written += len(chunk)
-            self._bump_progress(idx)  # determinate if we had a total; otherwise keep indeterminate
-        if total_rows is None:
-            self._progress_indeterminate_stop()
+            self._bump_progress(i)
+        if i == 0:
+            self._set_status("No data rows found after cleaning.")
 
-    def _try_count_rows_binary(self, path):
-        """
-        Count lines in binary to avoid decode errors, then subtract one for header if present.
-        If the file is empty or has 0/1 lines, return 0; if unsure, return None.
-        """
+    # ------------- Helpers -------------
+    def _count_lines_binary(self, path):
         try:
             with open(path, "rb") as f:
-                # Count b'\n'; this can undercount last line if no newline—good enough for progress.
-                data = f.read()
-                lines = data.count(b"\n")
-                if lines <= 0:
-                    return 0
-                # Heuristic: assume header exists; subtract 1
-                return max(0, lines - 1)
+                buf = f.read()
+                return buf.count(b"\n") or buf.count(b"\r")
         except Exception:
             return None
 
@@ -282,33 +289,112 @@ class ChopperApp:
         ext = os.path.splitext(out_path)[1].lower()
         stem = out_path[:-len(ext)]
         if out_fmt == "csv":
-            # Excel-friendly UTF-8 with BOM
             df.to_csv(stem + ".csv", index=False, encoding="utf-8-sig")
         elif out_fmt == "xlsx":
             df.to_excel(stem + ".xlsx", index=False)
         elif out_fmt == "xlsb":
-            # Write temp xlsx then convert with Excel COM
             temp_xlsx = stem + ".__tmp__.xlsx"
             df.to_excel(temp_xlsx, index=False)
-            self._convert_xlsx_to_xlsb(temp_xlsx, stem + ".xlsb")
             try:
-                os.remove(temp_xlsx)
-            except Exception:
-                pass
+                self._convert_xlsx_to_xlsb(temp_xlsx, stem + ".xlsb")
+            except Exception as e:
+                # Fallback to XLSX if XLSB fails for any reason
+                fallback = stem + ".xlsx"
+                try:
+                    if not os.path.exists(fallback):
+                        os.replace(temp_xlsx, fallback)
+                    else:
+                        i = 1
+                        fb = f"{stem} (fallback {i}).xlsx"
+                        while os.path.exists(fb):
+                            i += 1
+                            fb = f"{stem} (fallback {i}).xlsx"
+                        os.replace(temp_xlsx, fb)
+                except Exception:
+                    pass
+                raise RuntimeError(f"XLSB conversion failed; wrote XLSX instead. Details: {e}")
+            finally:
+                try:
+                    if os.path.exists(temp_xlsx):
+                        os.remove(temp_xlsx)
+                except Exception:
+                    pass
+
+    # --------- Hardened XLSB conversion (Excel COM) ----------
+    def _abs_long_path(self, p: str) -> str:
+        p = os.path.abspath(p)
+        if sys.platform.startswith("win"):
+            if not p.startswith("\\\\?\\"):
+                p = "\\\\?\\" + p.replace("/", "\\")
+        return p
+
+    def _close_workbook_if_open(self, excel, target_fullname: str):
+        try:
+            for wb in list(excel.Workbooks):
+                try:
+                    if os.path.normcase(str(wb.FullName)) == os.path.normcase(target_fullname):
+                        wb.Close(SaveChanges=False)
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def _convert_xlsx_to_xlsb(self, xlsx_path: str, xlsb_path: str):
         if not (sys.platform.startswith("win") and WIN32_AVAILABLE):
             raise RuntimeError("XLSB conversion requires Windows + Excel (pywin32).")
-        self._set_status("Converting to XLSB via Excel…")
-        excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = False
+
+        os.makedirs(os.path.dirname(xlsb_path) or ".", exist_ok=True)
+
+        xlsx_abs = self._abs_long_path(xlsx_path)
+        xlsb_abs = self._abs_long_path(xlsb_path)
+
         try:
-            wb = excel.Workbooks.Open(xlsx_path)
-            # 50 = xlExcel12 (XLSB)
-            wb.SaveAs(xlsb_path, FileFormat=50)
-            wb.Close(SaveChanges=False)
+            if os.path.exists(xlsb_path):
+                os.remove(xlsb_path)
+        except Exception:
+            base, ext = os.path.splitext(xlsb_path)
+            i = 1
+            new_target = f"{base} ({i}){ext}"
+            while os.path.exists(new_target):
+                i += 1
+                new_target = f"{base} ({i}){ext}"
+            xlsb_path = new_target
+            xlsb_abs = self._abs_long_path(xlsb_path)
+
+        excel = win32.DispatchEx("Excel.Application")
+        excel.DisplayAlerts = False
+        excel.Visible = False
+
+        last_err = None
+        try:
+            for attempt in range(1, 4):
+                try:
+                    wb = excel.Workbooks.Open(xlsx_abs)
+                    try:
+                        self._close_workbook_if_open(excel, xlsb_abs)
+                        wb.CheckCompatibility = False
+                        # 50 = xlExcel12 (.xlsb)
+                        wb.SaveAs(xlsb_abs, FileFormat=50, Local=True)
+                    finally:
+                        wb.Close(SaveChanges=False)
+
+                    if os.path.exists(xlsb_path) and os.path.getsize(xlsb_path) > 0:
+                        return
+                    raise RuntimeError("Excel reported success but target file missing/empty.")
+                except Exception as e:
+                    last_err = e
+                    # backoff + tweak filename to dodge locks/collisions
+                    import time, random
+                    time.sleep(0.6 * attempt)
+                    base, ext = os.path.splitext(xlsb_path)
+                    xlsb_path = f"{base} (retry {attempt}){ext}"
+                    xlsb_abs = self._abs_long_path(xlsb_path)
+            raise RuntimeError(f"Excel SaveAs to XLSB failed after retries: {last_err}")
         finally:
-            excel.Quit()
+            try:
+                excel.Quit()
+            except Exception:
+                pass
 
     # ------------- Progress helpers -------------
     def _set_progress_total(self, total):
@@ -321,18 +407,16 @@ class ChopperApp:
         self.master.update_idletasks()
 
     def _progress_indeterminate_start(self):
-        self.progress.configure(mode="indeterminate")
-        self.progress.start(60)
+        self.progress.configure(mode="indeterminate"); self.progress.start(60)
 
     def _progress_indeterminate_stop(self):
-        self.progress.stop()
+        try: self.progress.stop()
+        except Exception: pass
         self.progress.configure(mode="determinate", value=0)
 
     def _progress_reset(self):
-        try:
-            self.progress.stop()
-        except Exception:
-            pass
+        try: self.progress.stop()
+        except Exception: pass
         self.progress.configure(mode="determinate", value=0)
 
     # ------------- Misc -------------
@@ -341,13 +425,17 @@ class ChopperApp:
         candidate = os.path.join(out_dir, f"{stem}_{idx}{ext}")
         n = 1
         while os.path.exists(candidate):
-            candidate = os.path.join(out_dir, f"{stem}_{idx}({n}){ext}")
-            n += 1
+            candidate = os.path.join(out_dir, f"{stem}_{idx}({n}){ext}"); n += 1
         return candidate
 
     def _set_status(self, text):
-        self.status_text.set(text)
-        self.master.update_idletasks()
+        self.status_text.set(text); self.master.update_idletasks()
+
+    def _on_close(self):
+        for p in self.temp_paths:
+            try: os.remove(p)
+            except Exception: pass
+        self.master.destroy()
 
 
 def main():
